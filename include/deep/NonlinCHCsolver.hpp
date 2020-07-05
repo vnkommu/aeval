@@ -48,21 +48,28 @@ namespace ufo
     Expr quantifierElimination(Expr& cond, ExprSet& vars)
     {
       if (vars.size() == 0) return simplifyBool(cond);
+
+      if (containsOp<FORALL>(cond) || containsOp<EXISTS>(cond))
+        return mk<TRUE>(m_efac);
+
       Expr newCond;
       if (isNonlinear(cond)) {
-        newCond = simpleQE(cond, vars, true, true);
+        newCond = simpleQE(cond, vars);
         if (!u.implies(cond, newCond)) {
-          newCond = mk<TRUE>(m_efac);
+          return mk<TRUE>(m_efac);
         }
       } else {
         AeValSolver ae(mk<TRUE>(m_efac), cond, vars); // exists quantified . formula
         if (ae.solve()) {
           newCond = ae.getValidSubset();
         } else {
-          newCond = mk<TRUE>(m_efac);
+          return mk<TRUE>(m_efac);
         }
       }
-
+      if (!emptyIntersect(newCond, vars)) // sanity check
+      {
+        return mk<TRUE>(m_efac);
+      }
       return simplifyBool(newCond);
     }
 
@@ -133,8 +140,10 @@ namespace ufo
         if (find(ev1.begin(), ev1.end(), *it) == ev1.end()) ++it;
         else it = ev3.erase(it);
       }
+
       e = quantifierElimination(e, ev3);
       if (backward) e = mkNeg(e);
+      e = simplifyBool(simplifyArithm(e, false, true));
 
 //      ExprSet cnjs;
 //      getConj(e, cnjs);
@@ -192,18 +201,24 @@ namespace ufo
 //      for (auto & hr : ruleManager.chcs)
       {
         if (hr.isQuery) return;
+
+        Expr body = getQuantifiedCands(true, hr);
+
         ExprSet all;
-        all.insert(hr.body);
+        all.insert(body);
         for (int i = 0; i < hr.srcVars.size(); i++)
         {
           Expr rel = hr.srcRelations[i];
-          // currently, tries all candidates; but in principle, should try various subsets
-          for (auto & c : candidates[rel])
-            all.insert(replaceAll(c, ruleManager.invVars[rel], hr.srcVars[i]));
+          if (!hasArrays) // we need "clean" invariants in the case of arrays (to be used as ranges)
+          {
+            // currently, tries all candidates; but in principle, should try various subsets
+            for (auto & c : candidates[rel])
+              all.insert(replaceAll(c, ruleManager.invVars[rel], hr.srcVars[i]));
+          }
         }
 
         if (hr.isInductive)   // get candidates of form [ <var> mod <const> = <const> ]
-          retrieveDeltas (hr.body, hr.srcVars[0], hr.dstVars, candidates[hr.dstRelation]);
+          retrieveDeltas (body, hr.srcVars[0], hr.dstVars, candidates[hr.dstRelation]);
 
         preproGuessing(conjoin(all, m_efac), hr.dstVars, ruleManager.invVars[hr.dstRelation], candidates[hr.dstRelation]);
       }
@@ -211,8 +226,6 @@ namespace ufo
 
     void propagateCandidatesBackward(HornRuleExt& hr)
     {
-      if (hasArrays) return; // something is wrong, currently
-
 //      for (auto & hr : ruleManager.chcs)
       {
         if (hr.isFact) return;
@@ -239,7 +252,11 @@ namespace ufo
         if (hr.srcVars.size() == 1) invVars = ruleManager.invVars[rels[0]];
 
         ExprSet cands;
-        if (hr.isQuery) cands.insert(mk<FALSE>(m_efac));
+        if (hr.isQuery)
+        {
+          if (getQuantifiedCands(false, hr) == NULL) return;
+          else cands.insert(mk<FALSE>(m_efac));
+        }
         else cands = candidates[dstRel];
 
         ExprSet mixedCands;
@@ -580,12 +597,15 @@ namespace ufo
         outs () << ") Bool\n  ";
 
         ExprSet lms = a.second;
+        Expr res = simplifyBool(simplifyArithm(conjoin(lms, m_efac)));
         if (simplify)
         {
+          lms.clear();
+          getConj(res, lms);
           shrinkCnjs(lms);
           u.removeRedundantConjuncts(lms);
+          res = conjoin(lms, m_efac);
         }
-        Expr res = simplifyArithm(conjoin(lms, m_efac));
         u.print(res);
         outs () << ")\n";
       }
@@ -614,6 +634,61 @@ namespace ufo
       }
 
       return true;
+    }
+
+    Expr getQuantifiedCands(bool fwd, HornRuleExt& hr)
+    {
+      ExprSet qVars;
+      Expr body = hr.body;
+      if (fwd && hr.isFact)
+      {
+        getQuantifiedVars(hr.body, qVars);
+        if (!qVars.empty())  // immediately try proving properties if already quantified
+        {
+          // make sure that we can use it as a property (i.e., variables check)
+
+          ExprSet allVars;
+          filter (hr.body, bind::IsConst (), inserter (allVars, allVars.begin()));
+          minusSets(allVars, qVars);
+          bool allGood = true;
+          for (auto & v : allVars)
+            if (find (hr.dstVars.begin(), hr.dstVars.end(), v) == hr.dstVars.end())
+              { allGood = false; break; }
+          if (allGood)
+          {
+            ExprSet tmpSet;
+            getQuantifiedFormulas(hr.body, tmpSet);
+            for (auto c : tmpSet)
+            {
+              // over-approximate the body such that it can pass through the seed mining etc..
+              body = replaceAll(body, c, mk<TRUE>(m_efac));
+              c = replaceAll(c, hr.dstVars, ruleManager.invVars[hr.dstRelation]);
+              candidates[hr.dstRelation].insert(c);
+            }
+          }
+        }
+      }
+      if (!fwd && hr.isQuery)  // similar for the query
+      {
+        getQuantifiedVars(hr.body, qVars);
+        if (!qVars.empty())
+        {
+          ExprSet allVars;
+          filter (hr.body, bind::IsConst (), inserter (allVars, allVars.begin()));
+          minusSets(allVars, qVars);
+          for (int i = 0; i < hr.srcVars.size(); i++)
+          {
+            bool toCont = false;
+            for (auto & v : allVars)
+              if (find (hr.srcVars[i].begin(), hr.srcVars[i].end(), v) == hr.srcVars[i].end())
+                { toCont = true; break; }
+            if (toCont) continue;
+            getQuantifiedFormulas(mkNeg(hr.body), candidates[hr.srcRelations[i]]);
+          }
+          return NULL; // just as an indicator that everything went well
+        }
+      }
+      return body;
     }
 
     bool hasQuantifiedCands(map<Expr, ExprSet>& cands)
@@ -710,8 +785,9 @@ namespace ufo
           hr = &a;
 
           getCounters(a.body, counters);
-          for (auto & c : counters)
+          for (Expr c : counters)
           {
+            c = simplifyArithm(c);
             ind = getVarIndex(c, a.srcVars[0] /*hack for now*/);
             if (ind < 0) continue;
 
@@ -737,15 +813,23 @@ namespace ufo
       {
         if (!a.isInductive && a.dstRelation == tgt)
         {
-          ExprSet cnjs;
-          getConj(a.body, cnjs);
-          for (Expr e : cnjs)
+          int max_sz = INT_MAX;
+          for (Expr e : candidates[tgt])
           {
-            if (isOpX<EQ>(e) && (e->left() == a.dstVars[ind] || e->right() == a.dstVars[ind]))
+            if ((iterGrows &&
+               ((isOpX<GEQ>(e) && iterator == e->left()) ||
+                (isOpX<LEQ>(e) && iterator == e->right()))) ||
+               (!iterGrows &&
+                 ((isOpX<GEQ>(e) && iterator == e->right()) ||
+                  (isOpX<LEQ>(e) && iterator == e->left()))))
             {
-              Expr bound = (e->left() == a.dstVars[ind]) ? e->right() : e->left();
-              range = iterGrows ? mk<AND>(mk<LEQ>(bound, qVar), mk<LT>(qVar, iterator)) :
-                                  mk<AND>(mk<LT>(iterator, qVar), mk<LEQ>(qVar, bound));
+              Expr bound = (e->left() == iterator) ? e->right() : e->left();
+              if (treeSize(bound) < max_sz)
+              {
+                range = iterGrows ? mk<AND>(mk<LEQ>(bound, qVar), mk<LT>(qVar, iterator)) :
+                                    mk<AND>(mk<LT>(iterator, qVar), mk<LEQ>(qVar, bound));
+                max_sz = treeSize(bound);
+              }
             }
           }
         }
